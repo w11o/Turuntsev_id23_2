@@ -1,97 +1,73 @@
-
-#source myenv/bin/activate - wsl
-
+from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.responses import JSONResponse
-from fastapi import FastAPI
-import subprocess
-import itertools
-from typing import Dict
+from celery.result import AsyncResult
+from celery_app import celery_app
+from pydantic import BaseModel
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import itertools
+import hashlib
+import logging
+import os
 
 app = FastAPI()
-tasks: Dict[str, Dict] = {}
-task_id = -1
+logger = logging.getLogger(__name__)
 
-def run_task(task_id: str, hash_value: str, charset: str, max_length: int):
-    generate_passwords(task_id, charset, max_length)
-    crack_pass(task_id, hash_value)
+# Модель для входящих данных
+class HashRequest(BaseModel):
+    hash_value: str
+    charset: str = "0123456789"
+    max_length: int = 4
 
+# WebSocket менеджер
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[str, WebSocket] = {}
+
+    async def connect(self, websocket: WebSocket, task_id: str):
+        await websocket.accept()
+        self.active_connections[task_id] = websocket
+
+    def disconnect(self, task_id: str):
+        if task_id in self.active_connections:
+            del self.active_connections[task_id]
+
+    async def send_message(self, message: dict, task_id: str):
+        if task_id in self.active_connections:
+            await self.active_connections[task_id].send_json(message)
+
+manager = ConnectionManager()
 
 @app.post("/brut_hash")
-async def create_task(hash_value: str, charset: str, max_length: int):
-    global task_id
-
-    if max_length > 8:
-        return JSONResponse(content={"error": "Максимальная длина не должна превышать 8 символов"}, status_code=400)
-    task_id+=1
+async def create_task(request: HashRequest):
+    if request.max_length > 8:
+        raise HTTPException(400, "Максимальная длина не должна превышать 8 символов")
     
-    # generate_passwords(charset, max_length)
-    # pswd = crack_pass(hash_value)
-    tasks[task_id] = {
-        "status": "running",
-        "hash_value": hash_value,
-        "charset": charset,
-        "progress": 0,
-        "result": None
+    # Запуск фоновой задачи
+    task = celery_app.send_task(
+        "bruteforce_task", 
+        args=[request.hash_value, request.charset, request.max_length]
+    )
+    return JSONResponse({"task_id": task.id}, status_code=200)
+
+@app.websocket("/ws/{task_id}")
+async def websocket_endpoint(websocket: WebSocket, task_id: str):
+    await manager.connect(websocket, task_id)
+    try:
+        while True:
+            await websocket.receive_text()  # Для поддержания соединения
+    except:
+        manager.disconnect(task_id)
+
+@app.get("/task_status/{task_id}")
+async def get_task_status(task_id: str):
+    result = AsyncResult(task_id, app=celery_app)
+    return {
+        "status": result.status,
+        "result": result.result
     }
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor() as pool:
-        await loop.run_in_executor(pool, run_task, task_id, hash_value, charset, max_length)
-
-    return JSONResponse(content={"task_id": task_id}, status_code=200)
-
-@app.get("/get_status")
-async def get_status(id: int):
-    return tasks[id]
 
 
 
-def generate_passwords(task_id, charset: str, max_length: int, output_file: str = "passwords.txt"):
-    with open(str(task_id) + output_file, "w") as f:
-        for length in range(1, max_length + 1):
-            for combo in itertools.product(charset, repeat=length):
-                password = ''.join(combo)
-                f.write(password + '\n')
-
-
-
-def crack_pass(task_id, hash_str):
-    hash_str = hash_str.split(':', 1)[1]
-
-    wordlist = str(task_id) + 'passwords.txt'
-
-    with open('rar5_hash.txt', 'w') as f:
-        f.write(hash_str)
-
-    subprocess.run([
-        'hashcat',
-        '-m', '13000',
-        '-a', '0',
-        'rar5_hash.txt',
-        wordlist,
-        '--force'
-    ])
-
-    result = subprocess.check_output([
-        'hashcat',
-        '-m', '13000',
-        'rar5_hash.txt',
-        '--show'
-    ]).decode()
-
-    if ':' in result:
-        password = result.strip().split(':', 1)[1]
-        with open('found.txt', 'w') as f:
-            f.write(password + '\n')
-        print(f'[+] Пароль найден и сохранён в found.txt: {password}')
-        tasks[task_id]["status"] = "completed"
-        tasks[task_id]["result"] = password
-        tasks[task_id]["progress"] = "100%"
-    else:
-        print('[-] Пароль не найден.')
-        tasks[task_id]["status"] = "failed"
-        tasks[task_id]["result"] = "пароль не найден"
-        tasks[task_id]["progress"] = "0% "
-
-
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
